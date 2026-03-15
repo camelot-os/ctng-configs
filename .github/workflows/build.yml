@@ -1,0 +1,150 @@
+# SPDX-FileCopyrightText: 2026 H2Lab Development Team
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build cross-toolchain
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  SRC_CACHE: src
+
+jobs:
+
+  # If the workflow is triggered, this jobs returns the changeset for devcontainer and configs
+  # directory. This is used to filter the followinf jobs execution.
+  # This job outputs:
+  #  - devcontainer: boolean, True if devcontainer.json changes
+  #  - configs: boolean, True if any files changes in configs dir
+  #  - config_files: string list of changed files.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      devcontainer: ${{ steps.filter.outputs.devcontainer }}
+      configs: ${{ steps.filter.outputs.configs }}
+      config_files: ${{ steps.filter.outputs.configs_files }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            devcontainer:
+              - '.devcontainer/devcontainer.json'
+            configs:
+              - 'configs/**'
+
+  # If devcontainer.json file change, rebuild and publish devcontainer prebuilt image
+  prebuilt:
+    needs: changes
+    if: ${{ needs.changes.outputs.devcontainer == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pre-build dev container image
+        uses: devcontainers/ci@v0.3
+        with:
+          imageName: ghcr.io/camelot-os/prebuilt-ctng-devcontainer
+          cacheFrom: ghcr.io/camelot-os/prebuilt-ctng-devcontainer
+          push: always
+
+  # If any config files change, update cache for the given branch
+  # cache key is `package-sources-${{ github.ref_name }}-${{ github.sha }}`
+  cache_update:
+    needs: [changes, prebuilt]
+    if: ${{ !cancelled() && needs.changes.outputs.configs == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: |
+          mkdir ${{ env.SRC_CACHE }}
+      - name: Restore cached sources dir
+        id: cache-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ${{ env.SRC_CACHE }}
+          key: package-sources-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            package-sources-${{ github.ref_name }}
+            package-sources-main
+      - name: Download sources
+        uses: devcontainers/ci@v0.3
+        if: ${{ steps.cache-restore.outputs.cache-hit != 'true' }}
+        with:
+          cacheFrom: ghcr.io/camelot-os/prebuilt-ctng-devcontainer
+          push: never
+          runCmd: |
+            DEFCONFIG=configs/arm-none-eabi.defconfig ct-ng defconfig
+            # patch config for donwload only in cache directory
+            sed -i 's/.*CT_ONLY_DOWNLOAD.*/CT_ONLY_DOWNLOAD=y/' .config
+            sed -i 's/.*CT_LOCAL_TARBALLS_DIR.*/CT_LOCAL_TARBALLS_DIR=${{ env.SRC_CACHE }}/' .config
+            sed -i 's/.*CT_SAVE_TARBALLS.*/CT_SAVE_TARBALLS=y/' .config
+            sed -i 's/.*CT_LOG_PROGRESS_BAR.*/CT_LOG_PROGRESS_BAR=n/' .config
+            ct-ng build
+      - name: Save cached sources dir
+        id: cache-save
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ${{ env.SRC_CACHE }}
+          key: ${{ steps.cache-restore.outputs.cache-primary-key }}
+
+  build_toolchain:
+    needs: [changes, prebuilt, cache_update]
+    if: ${{ !cancelled() && needs.changes.outputs.configs == 'true' }}
+    strategy:
+      matrix:
+        defconfig: ${{ needs.changes.outputs.config_files }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: |
+          mkdir ${{ env.SRC_CACHE }}
+      - name: Restore cached sources dir
+        id: cache-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ${{ env.SRC_CACHE }}
+          key: package-sources-${{ github.ref_name }}-${{ github.sha }}
+          fail-on-cache-miss: true
+      - name: Target triple
+        id: target
+        run: |
+          filename=${{ matrix.defconfig }}
+          echo "triple=$(basename ${filename%.*})\n" >> $GITHUB_OUTPUT
+      - name: Build cross toolchain
+        uses: devcontainers/ci@v0.3
+        with:
+          cacheFrom: ghcr.io/camelot-os/prebuilt-ctng-devcontainer
+          push: never
+          runCmd: |
+            DEFCONFIG=${{ matrix.defconfig }} ct-ng defconfig
+            # do not donwload during build jobs, use cache only
+            sed -i 's/.*CT_FORBID_DOWNLOAD.*/CT_FORBID_DOWNLOAD=y/' .config
+            sed -i 's/.*CT_LOCAL_TARBALLS_DIR.*/CT_LOCAL_TARBALLS_DIR=${{ env.SRC_CACHE }}/' .config
+            sed -i 's/.*CT_LOG_PROGRESS_BAR.*/CT_LOG_PROGRESS_BAR=n/' .config
+            CT_PREFIX=$(pwd) ct-ng build
+      - name: TAR produced toolchain
+        run: |
+          tar cJf ${{ steps.target.outputs.triple }}.tar.xz ${{ steps.target.outputs.triple }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.target.outputs.triple }}.tar.xz
+          archive: false
