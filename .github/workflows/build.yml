@@ -7,6 +7,9 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
 
 env:
   SRC_CACHE: src
@@ -32,6 +35,7 @@ jobs:
       - uses: dorny/paths-filter@v4
         id: filter
         with:
+          list-files: json
           filters: |
             devcontainer:
               - '.devcontainer/devcontainer.json'
@@ -109,7 +113,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.configs == 'true' }}
     strategy:
       matrix:
-        defconfig: ${{ needs.changes.outputs.config_files }}
+        defconfig: ${{ fromJSON(needs.changes.outputs.config_files) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -127,7 +131,7 @@ jobs:
         id: target
         run: |
           filename=${{ matrix.defconfig }}
-          echo "triple=$(basename ${filename%.*})\n" >> $GITHUB_OUTPUT
+          echo "triple=$(basename ${filename%.*})" >> $GITHUB_OUTPUT
       - name: Build cross toolchain
         uses: devcontainers/ci@v0.3
         with:
