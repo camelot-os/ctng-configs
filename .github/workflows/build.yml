@@ -131,7 +131,7 @@ jobs:
         id: target
         run: |
           filename=${{ matrix.defconfig }}
-          echo "triple=$(basename ${filename%.*})\n" >> $GITHUB_OUTPUT
+          echo "triple=$(basename ${filename%.*})" >> $GITHUB_OUTPUT
       - name: Build cross toolchain
         uses: devcontainers/ci@v0.3
         with:
