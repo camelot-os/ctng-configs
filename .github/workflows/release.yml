@@ -81,7 +81,7 @@ jobs:
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.validate.outputs.triple }}
+          name: ${{ needs.validate.outputs.triple }}.tar.xz
 
       - name: Generate build provenance attestation
         uses: actions/attest-build-provenance@v2
