@@ -173,6 +173,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.target.outputs.triple }}
           path: ${{ steps.target.outputs.triple }}.tar.xz
           archive: false
