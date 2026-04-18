@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 H2Lab Development Team
+# SPDX-License-Identifier: Apache-2.0
+
+"""Generate a Software Bill of Materials (SBOM) for a crosstool-NG built toolchain.
+
+Reads `ct-ng show-config` output (via --show-config FILE or stdin) and the
+build log to extract component versions, SHA-512 checksums, and provenance.
+Checksums are sourced from the crosstool-NG package tree; the build log is
+used as a fallback for packages whose chksum file is not present yet.
+
+The primary download URL of each package (not a mirror) is considered the
+canonical provenance source: it is recorded alongside the verified digest,
+which makes mirror usage transparent and still auditable.
+
+Outputs SPDX 2.3 JSON or CycloneDX 1.6 JSON.
+
+Usage:
+    ct-ng show-config | generate-sbom --format spdx
+    generate-sbom --format cyclonedx --show-config show-config.txt
+    generate-sbom --format spdx --build-log build.log --output toolchain.spdx.json
+"""
+
+import argparse
+import json
+import re
+import sys
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Known package metadata: canonical download URL template, preferred archive
+# extension for the URL, SPDX license expression, and PURL namespace.
+# The "primary" source is the canonical upstream site (not a mirror).
+# ---------------------------------------------------------------------------
+
+_GNU_FTP = "https://ftp.gnu.org/gnu"
+
+PACKAGE_META: dict[str, dict] = {
+    "binutils": {
+        "url": f"{_GNU_FTP}/binutils/binutils-{{version}}.tar.xz",
+        "license": "GPL-3.0-or-later",
+        "description": "GNU Binary Utilities",
+    },
+    "gcc": {
+        "url": f"{_GNU_FTP}/gcc/gcc-{{version}}/gcc-{{version}}.tar.xz",
+        "license": "GPL-3.0-or-later WITH GCC-exception-3.1",
+        "description": "GNU Compiler Collection",
+    },
+    "gdb": {
+        "url": f"{_GNU_FTP}/gdb/gdb-{{version}}.tar.xz",
+        "license": "GPL-3.0-or-later",
+        "description": "GNU Debugger",
+    },
+    "picolibc": {
+        "url": "https://github.com/picolibc/picolibc/releases/download/{version}/picolibc-{version}.tar.xz",
+        "license": "BSD-3-Clause",
+        "purl": "pkg:github/picolibc/picolibc@{version}",
+        "description": "C library for embedded systems",
+    },
+    "expat": {
+        "url": "https://github.com/libexpat/libexpat/releases/download/R_{version_u}/expat-{version}.tar.xz",
+        "license": "MIT",
+        "purl": "pkg:github/libexpat/libexpat@{version}",
+        "description": "Expat XML parser library",
+    },
+    "gmp": {
+        "url": "https://gmplib.org/download/gmp/gmp-{version}.tar.xz",
+        "license": "LGPL-3.0-or-later",
+        "description": "GNU Multiple Precision Arithmetic Library",
+    },
+    "isl": {
+        "url": "https://libisl.sourceforge.io/isl-{version}.tar.xz",
+        "license": "MIT",
+        "description": "Integer Set Library",
+    },
+    "mpc": {
+        "url": "https://www.multiprecision.org/downloads/mpc-{version}.tar.gz",
+        "license": "LGPL-3.0-or-later",
+        "description": "GNU MPC complex arithmetic library",
+    },
+    "mpfr": {
+        "url": "https://www.mpfr.org/mpfr-{version}/mpfr-{version}.tar.xz",
+        "license": "LGPL-3.0-or-later",
+        "description": "GNU MPFR multiple-precision floating-point library",
+    },
+    "ncurses": {
+        "url": f"{_GNU_FTP}/ncurses/ncurses-{{version}}.tar.gz",
+        "license": "X11",
+        "description": "GNU ncurses terminal library",
+    },
+    "zlib": {
+        "url": "https://github.com/madler/zlib/releases/download/v{version}/zlib-{version}.tar.xz",
+        "license": "Zlib",
+        "purl": "pkg:github/madler/zlib@{version}",
+        "description": "zlib compression library",
+    },
+    "zstd": {
+        "url": "https://github.com/facebook/zstd/releases/download/v{version}/zstd-{version}.tar.gz",
+        "license": "BSD-3-Clause",
+        "purl": "pkg:github/facebook/zstd@{version}",
+        "description": "Zstandard compression library",
+    },
+    "autoconf": {
+        "url": f"{_GNU_FTP}/autoconf/autoconf-{{version}}.tar.xz",
+        "license": "GPL-3.0-or-later WITH Autoconf-exception-generic-3.0",
+        "description": "GNU Autoconf",
+    },
+    "automake": {
+        "url": f"{_GNU_FTP}/automake/automake-{{version}}.tar.xz",
+        "license": "GPL-2.0-or-later WITH Autoconf-exception-generic",
+        "description": "GNU Automake",
+    },
+    "bison": {
+        "url": f"{_GNU_FTP}/bison/bison-{{version}}.tar.xz",
+        "license": "GPL-3.0-or-later",
+        "description": "GNU Bison parser generator",
+    },
+    "dtc": {
+        "url": "https://cdn.kernel.org/pub/software/utils/dtc/dtc-{version}.tar.xz",
+        "license": "GPL-2.0-only",
+        "description": "Device Tree Compiler",
+    },
+    "libtool": {
+        "url": f"{_GNU_FTP}/libtool/libtool-{{version}}.tar.xz",
+        "license": "GPL-2.0-or-later",
+        "description": "GNU Libtool",
+    },
+    "m4": {
+        "url": f"{_GNU_FTP}/m4/m4-{{version}}.tar.xz",
+        "license": "GPL-3.0-or-later",
+        "description": "GNU M4 macro processor",
+    },
+    "make": {
+        "url": f"{_GNU_FTP}/make/make-{{version}}.tar.gz",
+        "license": "GPL-3.0-or-later",
+        "description": "GNU Make",
+    },
+}
+
+
+@dataclass
+class Component:
+    name: str
+    version: str
+    role: str
+    download_url: str
+    checksums: dict = field(default_factory=dict)  # {"SHA512": "<hex>", ...}
+    license_id: str = "NOASSERTION"
+    purl: str = ""
+    description: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Parsing helpers
+# ---------------------------------------------------------------------------
+
+_VERSION_RE = re.compile(r"^(.*?)-(\d[\d.]*)$")
+
+
+def _split_name_version(name_ver: str) -> tuple[str, str] | None:
+    """Split a 'name-version' string; return None if pattern does not match."""
+    m = _VERSION_RE.match(name_ver.strip())
+    return (m.group(1), m.group(2)) if m else None
+
+
+def parse_show_config(text: str) -> dict:
+    """Parse the text output of `ct-ng show-config` into a dict.
+
+    Expected format::
+
+        arm-none-eabi
+            Languages       : C,C++
+            OS              : bare-metal
+            Binutils        : binutils-2.46.0
+            ...
+    """
+    result: dict[str, str] = {}
+    first_content_line = True
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if ":" not in line:
+            if first_content_line:
+                result["target"] = line
+                first_content_line = False
+            continue
+        first_content_line = False
+        key, _, value = line.partition(":")
+        canonical = key.strip().lower().replace(" ", "_")
+        result[canonical] = value.strip()
+    return result
+
+
+def parse_build_log(log_path: Path) -> dict:
+    """Extract SHA-512 checksums and the crosstool-NG version from build.log.
+
+    Returns::
+
+        {
+            "ctng_version": "1.28.0.23_185f348",
+            "checksums": {"binutils-2.46.0.tar.xz": "<sha512hex>", ...},
+        }
+    """
+    sha512_re = re.compile(
+        r"\[DEBUG\]\s+Correct sha512 digest for ([^:]+):\s+([0-9a-f]+)"
+    )
+    version_re = re.compile(r"CT_PKGVERSION='crosstool-NG ([^']+)'")
+
+    checksums: dict[str, str] = {}
+    ctng_version: str | None = None
+
+    try:
+        with open(log_path) as fh:
+            for line in fh:
+                m = sha512_re.search(line)
+                if m:
+                    checksums[m.group(1).strip()] = m.group(2).strip()
+                if ctng_version is None:
+                    m = version_re.search(line)
+                    if m:
+                        ctng_version = m.group(1).strip()
+    except FileNotFoundError:
+        pass
+
+    return {"ctng_version": ctng_version, "checksums": checksums}
+
+
+def load_pkg_checksums(pkgs_dir: Path, name: str, version: str) -> dict[str, dict]:
+    """Load checksums from a crosstool-NG package chksum file.
+
+    The chksum file uses whitespace-separated lines of the form::
+
+        sha512  <archive-filename>  <hex-digest>
+
+    Returns a dict keyed by archive filename, each value being a dict of
+    ``{ALGORITHM_UPPER: hex_digest}``.
+    """
+    chksum_file = pkgs_dir / name / version / "chksum"
+    result: dict[str, dict] = {}
+    if not chksum_file.exists():
+        return result
+    with open(chksum_file) as fh:
+        for line in fh:
+            parts = line.strip().split()
+            if len(parts) == 3:
+                alg, filename, digest = parts
+                result.setdefault(filename, {})[alg.upper()] = digest
+    return result
+
+
+def _render_url(template: str, version: str) -> str:
+    version_u = version.replace(".", "_")
+    return template.format(version=version, version_u=version_u)
+
+
+def _archive_from_url(url: str) -> str:
+    return url.rsplit("/", 1)[-1]
+
+
+def resolve_component(
+    name: str,
+    version: str,
+    role: str,
+    pkgs_dir: Path,
+    log_data: dict,
+) -> Component:
+    """Build a Component with provenance, checksums, PURL, and license."""
+    meta = PACKAGE_META.get(name, {})
+
+    url_tmpl = meta.get("url", "NOASSERTION")
+    download_url = (
+        _render_url(url_tmpl, version) if url_tmpl != "NOASSERTION" else "NOASSERTION"
+    )
+    archive = _archive_from_url(download_url) if download_url != "NOASSERTION" else ""
+
+    # Prefer checksums from the package tree; fall back to build.log for
+    # packages not yet tracked there (e.g. a freshly released version).
+    checksums: dict[str, str] = {}
+    if archive:
+        pkg_chksums = load_pkg_checksums(pkgs_dir, name, version)
+        if archive in pkg_chksums:
+            checksums = pkg_chksums[archive]
+        if "SHA512" not in checksums:
+            log_digest = log_data["checksums"].get(archive)
+            if log_digest:
+                checksums["SHA512"] = log_digest
+
+    # PURL: use explicit template from metadata when provided, otherwise
+    # fall back to pkg:generic.
+    purl_tmpl = meta.get("purl")
+    if purl_tmpl:
+        purl = _render_url(purl_tmpl, version)
+    else:
+        purl = f"pkg:generic/{name}@{version}"
+
+    return Component(
+        name=name,
+        version=version,
+        role=role,
+        download_url=download_url,
+        checksums=checksums,
+        license_id=meta.get("license", "NOASSERTION"),
+        purl=purl,
+        description=meta.get("description", f"{name} {version}"),
+    )
+
+
+def collect_components(
+    config: dict, pkgs_dir: Path, log_data: dict
+) -> list[Component]:
+    """Build the ordered list of components from the parsed show-config dict."""
+    components: list[Component] = []
+
+    def _add(name_ver: str, role: str) -> None:
+        parsed = _split_name_version(name_ver)
+        if parsed is None:
+            return
+        name, version = parsed
+        components.append(resolve_component(name, version, role, pkgs_dir, log_data))
+
+    _add(config.get("binutils", ""), "assembler-linker")
+    _add(config.get("compiler", ""), "compiler")
+    _add(config.get("c_library", ""), "c-library")
+
+    for item in config.get("debug_tools", "").split():
+        _add(item, "debug-tool")
+
+    for item in config.get("companion_libs", "").split():
+        _add(item, "companion-library")
+
+    for item in config.get("companion_tools", "").split():
+        _add(item, "companion-tool")
+
+    return components
+
+
+# ---------------------------------------------------------------------------
+# SPDX 2.3 JSON generator
+# ---------------------------------------------------------------------------
+
+_SPDX_ALG = {"SHA512": "SHA512", "SHA256": "SHA256", "SHA1": "SHA1", "MD5": "MD5"}
+
+
+def _spdx_safe_id(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9.\-]", "-", text)
+
+
+def generate_spdx(
+    config: dict,
+    components: list[Component],
+    log_data: dict,
+    toolchain_name: str,
+) -> dict:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ctng_ver = log_data.get("ctng_version") or "unknown"
+    doc_ns = f"https://spdx.org/spdxdocs/{toolchain_name}-{uuid.uuid4()}"
+    root_id = f"SPDXRef-toolchain-{_spdx_safe_id(toolchain_name)}"
+
+    packages = [
+        {
+            "SPDXID": root_id,
+            "name": toolchain_name,
+            "versionInfo": ctng_ver,
+            "downloadLocation": "NOASSERTION",
+            "filesAnalyzed": False,
+            "comment": (
+                f"Cross-compilation toolchain for {toolchain_name}, "
+                f"built with crosstool-NG {ctng_ver}. "
+                f"Languages: {config.get('languages', 'N/A')}. "
+                f"OS/ABI: {config.get('os', 'N/A')}."
+            ),
+            "licenseConcluded": "NOASSERTION",
+            "licenseDeclared": "NOASSERTION",
+            "copyrightText": "2026 H2Lab Development Team",
+        }
+    ]
+    relationships = [
+        {
+            "spdxElementId": "SPDXRef-DOCUMENT",
+            "relationshipType": "DESCRIBES",
+            "relatedSpdxElement": root_id,
+        }
+    ]
+
+    for comp in components:
+        spdx_id = f"SPDXRef-{_spdx_safe_id(comp.name)}-{_spdx_safe_id(comp.version)}"
+        pkg: dict = {
+            "SPDXID": spdx_id,
+            "name": comp.name,
+            "versionInfo": comp.version,
+            "downloadLocation": comp.download_url,
+            "filesAnalyzed": False,
+            "comment": comp.description,
+            "licenseConcluded": comp.license_id,
+            "licenseDeclared": comp.license_id,
+            "copyrightText": "NOASSERTION",
+            "externalRefs": [
+                {
+                    "referenceCategory": "PACKAGE-MANAGER",
+                    "referenceType": "purl",
+                    "referenceLocator": comp.purl,
+                }
+            ],
+        }
+        chks = [
+            {"algorithm": _SPDX_ALG[a], "checksumValue": d}
+            for a, d in comp.checksums.items()
+            if a in _SPDX_ALG
+        ]
+        if chks:
+            pkg["checksums"] = chks
+
+        packages.append(pkg)
+        relationships.append(
+            {
+                "spdxElementId": root_id,
+                "relationshipType": "CONTAINS",
+                "relatedSpdxElement": spdx_id,
+            }
+        )
+
+    return {
+        "SPDXID": "SPDXRef-DOCUMENT",
+        "spdxVersion": "SPDX-2.3",
+        "creationInfo": {
+            "created": now,
+            "creators": [
+                "Tool: generate-sbom",
+                f"Tool: crosstool-NG {ctng_ver}",
+            ],
+            "comment": (
+                f"SBOM generated from build.log and ct-ng show-config "
+                f"for toolchain '{toolchain_name}'."
+            ),
+        },
+        "name": f"{toolchain_name}-sbom",
+        "dataLicense": "CC0-1.0",
+        "documentNamespace": doc_ns,
+        "packages": packages,
+        "relationships": relationships,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CycloneDX 1.6 JSON generator
+# ---------------------------------------------------------------------------
+
+_CDX_ALG = {"SHA512": "SHA-512", "SHA256": "SHA-256", "SHA1": "SHA-1", "MD5": "MD5"}
+
+_ROLE_CDX_TYPE = {
+    "compiler": "library",
+    "assembler-linker": "library",
+    "c-library": "library",
+    "debug-tool": "application",
+    "companion-library": "library",
+    "companion-tool": "application",
+}
+
+
+def _cdx_licenses(license_id: str) -> list:
+    if not license_id or license_id == "NOASSERTION":
+        return []
+    if " WITH " in license_id or " AND " in license_id or " OR " in license_id:
+        return [{"expression": license_id}]
+    return [{"license": {"id": license_id}}]
+
+
+def generate_cyclonedx(
+    config: dict,
+    components: list[Component],
+    log_data: dict,
+    toolchain_name: str,
+) -> dict:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ctng_ver = log_data.get("ctng_version") or "unknown"
+
+    cdx_components = []
+    for comp in components:
+        hashes = [
+            {"alg": _CDX_ALG[a], "content": d}
+            for a, d in comp.checksums.items()
+            if a in _CDX_ALG
+        ]
+        entry: dict = {
+            "type": _ROLE_CDX_TYPE.get(comp.role, "library"),
+            "name": comp.name,
+            "version": comp.version,
+            "description": comp.description,
+            "purl": comp.purl,
+            "licenses": _cdx_licenses(comp.license_id),
+            "externalReferences": (
+                [
+                    {
+                        "type": "distribution",
+                        "url": comp.download_url,
+                        "comment": "Primary upstream source (provenance)",
+                    }
+                ]
+                if comp.download_url != "NOASSERTION"
+                else []
+            ),
+        }
+        if hashes:
+            entry["hashes"] = hashes
+        cdx_components.append(entry)
+
+    return {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.6",
+        "version": 1,
+        "serialNumber": f"urn:uuid:{uuid.uuid4()}",
+        "metadata": {
+            "timestamp": now,
+            "tools": [
+                {
+                    "vendor": "crosstool-NG",
+                    "name": "generate-sbom",
+                    "version": ctng_ver,
+                }
+            ],
+            "component": {
+                "type": "application",
+                "name": toolchain_name,
+                "version": ctng_ver,
+                "description": (
+                    f"Cross-compilation toolchain for "
+                    f"{toolchain_name}. "
+                    f"Languages: {config.get('languages', 'N/A')}. "
+                    f"OS/ABI: {config.get('os', 'N/A')}."
+                ),
+                "purl": f"pkg:generic/{toolchain_name}@{ctng_ver}",
+            },
+        },
+        "components": cdx_components,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+def _find_ctng_packages_dir(script_dir: Path) -> Path:
+    candidates = [
+        script_dir.parent / "crosstool-ng" / "packages",
+        script_dir.parent.parent / "crosstool-ng" / "packages",
+        Path("/usr/local/share/crosstool-ng/packages"),
+        Path("/usr/share/crosstool-ng/packages"),
+    ]
+    for p in candidates:
+        if p.is_dir():
+            return p
+    return script_dir.parent / "crosstool-ng" / "packages"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate an SBOM for a crosstool-NG toolchain.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  ct-ng show-config | %(prog)s --format spdx
+  %(prog)s --format cyclonedx --show-config show-config.txt
+  %(prog)s --format spdx --build-log build.log --output toolchain.spdx.json
+""",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["spdx", "cyclonedx"],
+        required=True,
+        metavar="FORMAT",
+        help="Output format: 'spdx' (SPDX 2.3 JSON) or 'cyclonedx' (CycloneDX 1.6 JSON)",
+    )
+    parser.add_argument(
+        "--show-config",
+        metavar="FILE",
+        help="Path to ct-ng show-config output (default: read from stdin)",
+    )
+    parser.add_argument(
+        "--build-log",
+        metavar="FILE",
+        default="build.log",
+        help="Path to the crosstool-NG build log (default: ./build.log)",
+    )
+    parser.add_argument(
+        "--ctng-dir",
+        metavar="DIR",
+        help="Path to a crosstool-NG directory containing a packages/ sub-directory",
+    )
+    parser.add_argument(
+        "--output",
+        metavar="FILE",
+        help="Write SBOM to FILE instead of stdout",
+    )
+    parser.add_argument(
+        "--toolchain-name",
+        metavar="NAME",
+        help="Override the toolchain name (default: target triple from show-config)",
+    )
+
+    args = parser.parse_args()
+
+    # --- read show-config ---------------------------------------------------
+    if args.show_config:
+        config_text = Path(args.show_config).read_text()
+    else:
+        if sys.stdin.isatty():
+            parser.error(
+                "provide --show-config FILE or pipe `ct-ng show-config` output via stdin"
+            )
+        config_text = sys.stdin.read()
+
+    config = parse_show_config(config_text)
+    toolchain_name = args.toolchain_name or config.get("target") or "toolchain"
+
+    # --- read build log ------------------------------------------------------
+    log_data = parse_build_log(Path(args.build_log))
+    if not log_data.get("ctng_version"):
+        print(
+            f"Warning: could not determine crosstool-NG version from {args.build_log}",
+            file=sys.stderr,
+        )
+
+    # --- locate ctng packages directory -------------------------------------
+    if args.ctng_dir:
+        pkgs_dir = Path(args.ctng_dir) / "packages"
+    else:
+        pkgs_dir = _find_ctng_packages_dir(Path(__file__).resolve().parent)
+    if not pkgs_dir.is_dir():
+        print(
+            f"Warning: crosstool-NG packages directory not found: {pkgs_dir}",
+            file=sys.stderr,
+        )
+
+    # --- collect components -------------------------------------------------
+    components = collect_components(config, pkgs_dir, log_data)
+
+    # --- generate SBOM ------------------------------------------------------
+    if args.format == "spdx":
+        sbom = generate_spdx(config, components, log_data, toolchain_name)
+    else:
+        sbom = generate_cyclonedx(config, components, log_data, toolchain_name)
+
+    output = json.dumps(sbom, indent=2)
+
+    if args.output:
+        Path(args.output).write_text(output)
+        print(f"SBOM written to {args.output}", file=sys.stderr)
+    else:
+        print(output)
+
+
+if __name__ == "__main__":
+    main()
