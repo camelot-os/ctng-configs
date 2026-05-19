@@ -170,9 +170,9 @@ jobs:
             SBOM_CDX=${{ steps.target.outputs.triple }}.cdx.json
 
             ct-ng show-config > ${CFG}
-            GEN_SBOM_ARGS=--toolchain-name ${{ steps.target.outputs.triple }} --show-config ${CFG}
-            support/generate-sbom ${GEN_SBOM_ARGS} --format spdx --output $ {SBOM_SDPX}
-            support/generate-sbom ${GEN_SBOM_ARGS} --format cyclonedx --output $ {SBOM_CDX}
+            GEN_SBOM_ARGS="--toolchain-name ${{ steps.target.outputs.triple }} --show-config ${CFG}"
+            support/generate-sbom ${GEN_SBOM_ARGS} --format spdx --output ${SBOM_SDPX}
+            support/generate-sbom ${GEN_SBOM_ARGS} --format cyclonedx --output ${SBOM_CDX}
       - name: TAR produced toolchain
         run: |
           tar cJf ${{ steps.target.outputs.triple }}.tar.xz ${{ steps.target.outputs.triple }}
